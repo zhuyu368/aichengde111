@@ -4908,39 +4908,7 @@ input:checked + .slider:before {
   <!-- 聊天区域 -->
   <section class="chat-section">
     <div class="chat-container">
-      <div class="messages-area" id="messagesArea"><div class="message-container other"><div class="message-avatar"><span></span></div><div class="message-content"><div class="message other">
-                        
-                        
-                        你好！欢迎使用私密聊天。点击右上角的齿轮图标可以管理表情包和回复词条。
-                        <div class="message-time">
-                            <span>23:32:54</span>
-                            <span class="message-status">
-                                <span class="status-check double">✓✓</span>
-                                <span>已读</span>
-                                
-                            </span>
-                        </div>
-                    </div><div class="message-actions">
-                        <button class="message-action-btn quote" data-id="1774107174895">引用</button>
-                        <button class="message-action-btn delete" data-id="1774107174895">删除</button>
-                        
-                    </div></div></div><div class="message-container self"><div class="message-avatar"><span></span></div><div class="message-content"><div class="message self">
-                        
-                        
-                        1111
-                        <div class="message-time">
-                            <span>21:07:11</span>
-                            <span class="message-status">
-                                <span class="status-check single">✓</span>
-                                <span>未读</span>
-                                
-                            </span>
-                        </div>
-                    </div><div class="message-actions">
-                        <button class="message-action-btn quote" data-id="msg_1775826431248_6xv19601i">引用</button>
-                        <button class="message-action-btn delete" data-id="msg_1775826431248_6xv19601i">删除</button>
-                        <button class="message-action-btn recall" data-id="msg_1775826431248_6xv19601i">撤回</button>
-                    </div></div></div></div>
+      <div class="messages-area" id="messagesArea"></div>
       
       <div class="input-area">
         <div class="input-area-buttons">
@@ -5766,19 +5734,21 @@ class AppIDB {
                 }
             };
             req.onerror = () => reject(req.error);
-            req.onsuccess = e => {
+            req.onsuccess = async e => {
                 this._db = e.target.result;
                 // 将所有现有数据加载进内存缓存
                 const tx = this._db.transaction(this.STORE, 'readonly');
                 const store = tx.objectStore(this.STORE);
                 const keysReq = store.getAllKeys();
                 const valsReq = store.getAll();
-                tx.oncomplete = () => {
+                tx.oncomplete = async () => {
                     const keys = keysReq.result || [];
                     const vals = valsReq.result || [];
                     keys.forEach((k, i) => this._cache.set(k, vals[i]));
-                    // 迁移旧 localStorage 数据（一次性）
-                    this._migrateFromLocalStorage().then(resolve).catch(resolve);
+                    // 等待迁移完成后再 resolve
+                    await this._migrateFromLocalStorage();
+                    console.log('✅ AppIDB 初始化完成，已加载', this._cache.size, '个键');
+                    resolve();
                 };
                 tx.onerror = () => {
                     console.error('AppIDB 加载缓存失败', tx.error);
@@ -5833,10 +5803,10 @@ class AppIDB {
         return Array.from(this._cache.keys());
     }
 
-    /** 写入（更新缓存 + 异步持久化 IDB）*/
-    set(key, value) {
+    /** 写入（更新缓存 + 等待 IDB 持久化完成）*/
+    async set(key, value) {
         this._cache.set(key, value);
-        this._idbSet(key, value).catch(e => console.warn('AppIDB set 失败:', key, e));
+        await this._idbSet(key, value);
     }
 
     /** 删除（更新缓存 + 异步持久化 IDB）*/
@@ -5861,11 +5831,26 @@ class AppIDB {
     /** 内部：异步写入 IDB */
     _idbSet(key, value) {
         return new Promise((resolve, reject) => {
-            if (!this._db) { resolve(); return; }
-            const tx = this._db.transaction(this.STORE, 'readwrite');
-            tx.objectStore(this.STORE).put(value, key);
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
+            if (!this._db) {
+                // 数据库未就绪，等待初始化后重试
+                this.init()
+                    .then(() => this._idbSet(key, value))
+                    .then(resolve)
+                    .catch(reject);
+                return;
+            }
+            try {
+                const tx = this._db.transaction(this.STORE, 'readwrite');
+                const req = tx.objectStore(this.STORE).put(value, key);
+                tx.oncomplete = () => {
+                    this._cache.set(key, value);
+                    resolve();
+                };
+                tx.onerror = () => reject(tx.error);
+                req.onerror = () => reject(req.error);
+            } catch (e) {
+                reject(e);
+            }
         });
     }
 
@@ -5936,18 +5921,24 @@ this.PENDING_LETTER_ID_KEY = 'seven_and_wish_pending_letter_id';
      * 初始化数据 - 只在完全没有数据时创建默认数据
      * 不会覆盖已有数据
      */
-    initData() {
-        // 检查是否需要初始化默认数据（使用 IDB 缓存同步读取）
+    async initData() {
         const idb = window._appIDB;
-        const hasAnyData = idb.has(this.SELF_INFO_KEY) ||
-                          idb.has(this.OTHER_INFO_KEY) ||
-                          idb.has(this.MESSAGES_KEY);
-        
-        if (!hasAnyData) {
-            console.log('首次运行，创建默认数据');
-            this.createDefaultData();
+        await idb.init();
+
+        // 检查所有关键键是否存在
+        const hasAllData = idb.has(this.SELF_INFO_KEY) &&
+                           idb.has(this.OTHER_INFO_KEY) &&
+                           idb.has(this.MESSAGES_KEY) &&
+                           idb.has(this.PHRASES_KEY) &&
+                           idb.has(this.STICKERS_KEY) &&
+                           idb.has(this.SEND_SETTINGS_KEY) &&
+                           idb.has(this.APPEARANCE_KEY);
+
+        if (!hasAllData) {
+            console.log('⚠️ 检测到数据不完整，重新创建默认数据');
+            await this.createDefaultData();
         }
-        
+
         // 确保版本信息存在
         if (!idb.has(this.DATA_VERSION_KEY)) {
             idb.set(this.DATA_VERSION_KEY, this.DATA_VERSION);
@@ -5957,16 +5948,16 @@ this.PENDING_LETTER_ID_KEY = 'seven_and_wish_pending_letter_id';
     /**
      * 创建默认数据 - 只在第一次运行时调用
      */
-    createDefaultData() {
+    async createDefaultData() {
         // 默认自己信息
-        this.setStoredData(this.SELF_INFO_KEY, {
+        await this.setStoredData(this.SELF_INFO_KEY, {
             nickname: '我',
             avatar: null,
             status: '在线'
         });
         
         // 默认对方信息
-        this.setStoredData(this.OTHER_INFO_KEY, {
+        await this.setStoredData(this.OTHER_INFO_KEY, {
             nickname: '对方',
             avatar: null,
             status: '在DR',
@@ -5974,7 +5965,7 @@ this.PENDING_LETTER_ID_KEY = 'seven_and_wish_pending_letter_id';
         });
         
         // 默认发送设置
-this.setStoredData(this.SEND_SETTINGS_KEY, {
+await this.setStoredData(this.SEND_SETTINGS_KEY, {
     stickerRatio: 50,
     phraseRatio: 50,
     maxMessageCount: 3,
@@ -5988,27 +5979,27 @@ this.setStoredData(this.SEND_SETTINGS_KEY, {
 });
         
         // 默认外观设置
-        this.setStoredData(this.APPEARANCE_KEY, {
+        await this.setStoredData(this.APPEARANCE_KEY, {
             appTitle: '梦角爱人',
             appSubtitle: '绝对私密的一对一聊天空间',
             loveStartDate: new Date(2024, 0, 1).toISOString()
         });
         
         // 默认背景设置
-        this.setStoredData(this.BACKGROUND_KEY, {
+        await this.setStoredData(this.BACKGROUND_KEY, {
             backgroundImage: null,
             opacity: 100
         });
         
         // 默认塔罗牌设置
-        this.setStoredData(this.TAROT_KEY, {
+        await this.setStoredData(this.TAROT_KEY, {
             enabled: false,
             drawCount: 1,
             customPhrases: []
         });
         
         // 默认通信设置
-        this.setStoredData(this.COMMUNICATION_KEY, {
+        await this.setStoredData(this.COMMUNICATION_KEY, {
             autoAcceptCalls: true,
             autoAcceptVideos: true,
             todayCalls: 0,
@@ -6030,7 +6021,7 @@ this.setStoredData(this.SEND_SETTINGS_KEY, {
         });
         
         // 默认群聊设置
-        this.setStoredData(this.GROUP_SETTINGS_KEY, {
+        await this.setStoredData(this.GROUP_SETTINGS_KEY, {
             enabled: false,
             showAvatar: true,
             showName: true,
@@ -6038,7 +6029,7 @@ this.setStoredData(this.SEND_SETTINGS_KEY, {
         });
         
         // 默认音乐设置
-        this.setStoredData(this.MUSIC_SETTINGS_KEY, {
+        await this.setStoredData(this.MUSIC_SETTINGS_KEY, {
             musicList: [],
             autoPlayMusic: true,
             musicFrequency: 30,
@@ -6046,14 +6037,14 @@ this.setStoredData(this.SEND_SETTINGS_KEY, {
         });
 
         // 默认拍一拍设置
-this.setStoredData(this.POKE_SETTINGS_KEY, {
-    enabled: true,
-    frequency: 50,  // 把 20 改成 50 更容易测试
-    phrases: ["拍了拍你", "拍了拍我的肩膀", "拍了拍我的脑袋", "戳了戳我", "轻轻碰了碰我", "摸了摸我的头", "捏了捏我的脸"]
-});
+        await this.setStoredData(this.POKE_SETTINGS_KEY, {
+            enabled: true,
+            frequency: 50,
+            phrases: ["拍了拍你", "拍了拍我的肩膀", "拍了拍我的脑袋", "戳了戳我", "轻轻碰了碰我", "摸了摸我的头", "捏了捏我的脸"]
+        });
         
         // 默认回复词条
-        this.setStoredData(this.PHRASES_KEY, [
+        await this.setStoredData(this.PHRASES_KEY, [
             "好的，明白了",
             "这很有趣",
             "继续聊吧",
@@ -6066,9 +6057,9 @@ this.setStoredData(this.POKE_SETTINGS_KEY, {
             "谢谢分享"
         ]);
         
-        // 默认消息（只有一条欢迎消息）
-        this.setStoredData(this.MESSAGES_KEY, [{
-            id: Date.now(),
+        // 默认消息（只有一条欢迎消息，使用固定ID避免重复）
+        await this.setStoredData(this.MESSAGES_KEY, [{
+            id: 'default_welcome',
             text: "你好！欢迎使用私密聊天。点击右上角的齿轮图标可以管理表情包和回复词条。",
             sender: "other",
             time: this.getFormattedTime(Date.now()),
@@ -6076,19 +6067,19 @@ this.setStoredData(this.POKE_SETTINGS_KEY, {
         }]);
         
         // 空的表情包
-        this.setStoredData(this.STICKERS_KEY, []);
+        await this.setStoredData(this.STICKERS_KEY, []);
         
         // 已抽取塔罗牌记录
-        this.setStoredData(this.DRAWN_CARDS_KEY, []);
+        await this.setStoredData(this.DRAWN_CARDS_KEY, []);
         
         // 恋爱天数
-        this.setStoredData(this.LOVE_DAYS_KEY, 1);
+        await this.setStoredData(this.LOVE_DAYS_KEY, 1);
         
         // 已读不回记录
-        this.setStoredData(this.READ_NO_REPLY_KEY, []);
+        await this.setStoredData(this.READ_NO_REPLY_KEY, []);
         
         // 今日日期
-        this.setStoredData(this.TODAY_DATE_KEY, new Date().toDateString());
+        await this.setStoredData(this.TODAY_DATE_KEY, new Date().toDateString());
         
         // 保存版本
         window._appIDB.set(this.DATA_VERSION_KEY, this.DATA_VERSION);
@@ -6125,9 +6116,9 @@ this.setStoredData(this.POKE_SETTINGS_KEY, {
     /**
      * 安全地保存数据到 IDB（写缓存同步 + 异步持久化）
      */
-    setStoredData(key, data) {
+    async setStoredData(key, data) {
         try {
-            window._appIDB.set(key, data);
+            await this._setIDB(window._appIDB, key, data);
             return true;
         } catch (e) {
             console.error(`写入 IDB 失败 [${key}]:`, e);
@@ -6549,11 +6540,11 @@ savePendingLetterId(id) {
     /**
      * 清除所有数据（用于重置功能）
      */
-    clearAllData() {
+    async clearAllData() {
         try {
             window._appIDB.clearByPrefix('seven_and_wish_');
-            // 重新创建默认数据
-            this.createDefaultData();
+            // 等待默认数据创建完成
+            await this.createDefaultData();
             return true;
         } catch (e) {
             console.error('清除所有数据失败:', e);
@@ -6695,23 +6686,63 @@ class ChatApp {
         // init() 由 DOMContentLoaded 中 await 调用，此处不再同步触发
     }
 
-    // ---- 批量保存：防抖300ms，空闲时写入 ----
+    // ---- 立即持久化：每次数据变更后同步等待写入完成 ----
     markDirty() {
-        if (this._saveTimer) clearTimeout(this._saveTimer);
-        this._saveTimer = setTimeout(() => this.flushSave(), 300);
+        this.flushSave();
     }
 
-    flushSave() {
+    async flushSave() {
         if (this._isSaving) return;
         this._isSaving = true;
-        const fn = () => {
-            try { this.saveAllData(); } catch (e) {}
-            this._isSaving  = false;
+        try {
+            await this.saveAllDataSync();
+            console.log('✅ 数据已即时持久化');
+        } catch (e) {
+            console.error('❌ 数据持久化失败:', e);
+        } finally {
+            this._isSaving = false;
             this._saveTimer = null;
-        };
-        typeof requestIdleCallback !== 'undefined'
-            ? requestIdleCallback(fn, { timeout: 1000 })
-            : setTimeout(fn, 100);
+        }
+    }
+
+    /** 并行写入所有数据到 IDB */
+    async saveAllDataSync() {
+        const idb = window._appIDB;
+        const dm = this.dataManager;
+        await Promise.all([
+            this._setIDB(idb, dm.SELF_INFO_KEY, this.appData.selfInfo),
+            this._setIDB(idb, dm.OTHER_INFO_KEY, this.appData.otherInfo),
+            this._setIDB(idb, dm.MESSAGES_KEY, this.appData.messages),
+            this._setIDB(idb, dm.PHRASES_KEY, this.appData.phraseGroups),
+            this._setIDB(idb, dm.STICKERS_KEY, this.appData.stickers),
+            this._setIDB(idb, dm.SELF_STICKERS_KEY, this.appData.selfStickers || []),
+            this._setIDB(idb, dm.SEND_SETTINGS_KEY, this.appData.sendSettings),
+            this._setIDB(idb, dm.APPEARANCE_KEY, this.appData.appearanceSettings),
+            this._setIDB(idb, dm.BACKGROUND_KEY, this.appData.backgroundSettings),
+            this._setIDB(idb, dm.TAROT_KEY, this.appData.tarotSettings),
+            this._setIDB(idb, dm.COMMUNICATION_KEY, this.appData.communicationSettings),
+            this._setIDB(idb, dm.GROUP_SETTINGS_KEY, this.appData.groupSettings),
+            this._setIDB(idb, dm.MUSIC_SETTINGS_KEY, this.appData.musicSettings),
+            this._setIDB(idb, dm.POKE_SETTINGS_KEY, this.appData.pokeSettings),
+            this._setIDB(idb, dm.SELF_POKE_KEY, this.appData.selfPokeSettings || { phrases: [] }),
+            this._setIDB(idb, dm.LETTER_CONTENT_KEY, this.appData.letterContent || ''),
+            this._setIDB(idb, dm.LETTER_REPLY_SCHEDULED_KEY, this.appData.letterReplyScheduled || null),
+            this._setIDB(idb, dm.LETTER_LAST_SEND_TIME_KEY, this.appData.letterLastSendTime || null),
+            this._setIDB(idb, dm.LETTER_REPLIES_KEY, this.appData.letterReplies || []),
+            this._setIDB(idb, dm.PENDING_LETTER_MAP_KEY, this.appData.pendingLetterMap || {}),
+            this._setIDB(idb, dm.PENDING_LETTER_ID_KEY, this.appData.pendingLetterId || null),
+            this._setIDB(idb, dm.DRAWN_CARDS_KEY, Array.from(this.appData.drawnCards || [])),
+            this._setIDB(idb, dm.LOVE_DAYS_KEY, this.appData.loveDays),
+            this._setIDB(idb, dm.READ_NO_REPLY_KEY, this.appData.readNoReplyMessageIds || []),
+            this._setIDB(idb, dm.TODAY_DATE_KEY, this.appData.todayDate),
+        ]);
+    }
+
+    /** 辅助：写入缓存并等待 IDB 持久化完成 */
+    async _setIDB(idb, key, value) {
+        if (!key) return;
+        idb._cache.set(key, value);
+        await idb._idbSet(key, value);
     }
 
     /**
@@ -6837,79 +6868,11 @@ if (this.appData.letterReplyScheduled) {
     
     /**
      * 保存所有数据到localStorage
+     * @deprecated 已被 saveAllDataSync 替代，保留空壳避免调用报错
      */
     saveAllData() {
-        // 保存用户信息
-        this.dataManager.saveSelfInfo(this.appData.selfInfo);
-        this.dataManager.saveOtherInfo(this.appData.otherInfo);
-        
-        // 保存消息记录
-        this.dataManager.saveAllMessages(this.appData.messages);
-        
-        // 保存回复词条
-        this.dataManager.savePhraseGroups(this.appData.phraseGroups);
-        
-        // 保存表情包
-        this.dataManager.saveStickers(this.appData.stickers);
-        
-        // 保存发送设置
-        this.dataManager.saveSendSettings(this.appData.sendSettings);
-        
-        // 保存外观设置
-        this.dataManager.saveAppearanceSettings(this.appData.appearanceSettings);
-        
-        // 保存背景设置
-        this.dataManager.saveBackgroundSettings(this.appData.backgroundSettings);
-        
-        // 保存塔罗牌设置
-        this.dataManager.saveTarotSettings(this.appData.tarotSettings);
-        
-        // 保存通信设置
-        this.dataManager.saveCommunicationSettings(this.appData.communicationSettings);
-        
-        // 保存群聊设置
-        this.dataManager.saveGroupSettings(this.appData.groupSettings);
-        
-        // 保存音乐设置
-        this.dataManager.saveMusicSettings(this.appData.musicSettings);
-        
-        // 保存拍一拍设置
-        this.dataManager.savePokeSettings(this.appData.pokeSettings);
-        // 保存用户自己的表情包
-        this.dataManager.saveSelfStickers(this.appData.selfStickers || []);
-        // 保存用户自己的拍一拍文案
-        this.dataManager.saveSelfPokeSettings(this.appData.selfPokeSettings || { phrases: [] });
-
-        // 保存信件数据
-this.dataManager.saveLetterContent(this.appData.letterContent);
-this.dataManager.saveLetterReplyScheduled(this.appData.letterReplyScheduled);
-this.dataManager.saveLetterLastSendTime(this.appData.letterLastSendTime);
-this.dataManager.saveLetterReplies(this.appData.letterReplies);
-if (this.dataManager.savePendingLetterMap) {
-    this.dataManager.savePendingLetterMap(this.appData.pendingLetterMap || {});
-}
-if (this.dataManager.savePendingLetterId) {
-    this.dataManager.savePendingLetterId(this.appData.pendingLetterId || null);
-}
-
-// ===== 新增：保存信件映射数据 =====
-if (this.dataManager.savePendingLetterMap) {
-    this.dataManager.savePendingLetterMap(this.appData.pendingLetterMap || {});
-}
-if (this.dataManager.savePendingLetterId) {
-    this.dataManager.savePendingLetterId(this.appData.pendingLetterId || null);
-}
-        // 保存已抽取塔罗牌记录
-        this.dataManager.saveDrawnCards(this.appData.drawnCards);
-        
-        // 保存恋爱天数
-        this.dataManager.saveLoveDays(this.appData.loveDays);
-        
-        // 保存已读不回记录
-        this.dataManager.saveReadNoReplyIds(this.appData.readNoReplyMessageIds);
-        
-        // 保存今日日期
-        this.dataManager.saveTodayDate(this.appData.todayDate);
+        // 已由 saveAllDataSync 替代，此处调用新方法
+        this.saveAllDataSync().catch(e => console.error('saveAllData 失败:', e));
     }
     
     /**
@@ -6971,20 +6934,20 @@ if (this.dataManager.savePendingLetterId) {
         // 6. 显示加载成功通知
         this.showNotification('聊天记录已加载');
         
-        // 7. 自动保存定时器（每30秒）
-        setInterval(() => {
-            this.markDirty();
-        }, 30000);
-        
-        // 8. 页面关闭前保存
-        window.addEventListener('beforeunload', () => {
-            this.markDirty();
+        // 7. 自动保存已移除（改为即时持久化，每次markDirty直接写入IDB）
+
+        // 8. 页面关闭前强制等待保存完成
+        window.addEventListener('beforeunload', async (e) => {
+            e.preventDefault();
+            e.returnValue = '';
+            await this.flushSave();
+            await new Promise(resolve => setTimeout(resolve, 200));
         });
         
-        // 9. 页面可见性变化时保存
+        // 9. 页面可见性变化时立即持久化
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'hidden') {
-                this.markDirty();
+                this.flushSave();
             }
         });
         
@@ -10350,6 +10313,9 @@ const delay = minDelay + Math.random() * (maxDelay - minDelay);
             musicSettings: this.appData.musicSettings,
             pokeSettings: this.appData.pokeSettings,
             selfPokeSettings: this.appData.selfPokeSettings || { phrases: [] }, // 用户自己的拍一拍文案
+            // 气泡样式和预设
+            bubbleStyle: this.appData.bubbleStyle || { css: '' },
+            bubblePresets: this.appData.bubblePresets || [],
             momentsData: momentsFullData,                           // 朋友圈全部数据
             drawnCards: Array.from(this.appData.drawnCards || []),
             loveDays: this.appData.loveDays,
@@ -10556,9 +10522,9 @@ if (importAllBtn) {
         // 重置所有数据
         const resetAllBtn = document.getElementById('resetAllDataBtn');
         if (resetAllBtn) {
-            resetAllBtn.addEventListener('click', () => {
+            resetAllBtn.addEventListener('click', async () => {
                 if (confirm("【高危操作】确定要重置所有会话和设置吗？此操作将清除所有本地数据且无法恢复！")) {
-                    this.dataManager.clearAllData();
+                    await this.dataManager.clearAllData();
                     this.loadAllData();
                     this.renderAllUI();
                     this.showNotification('所有数据已重置，页面即将刷新', 'info');
@@ -10595,9 +10561,9 @@ if (importAllBtn) {
     // ========================
     // 清除所有数据 (已实现)
     // ========================
-    clearAllData() {
+    async clearAllData() {
         if (confirm('确定要清除所有数据吗？这将删除所有聊天记录、设置和表情包，且不可恢复。')) {
-            this.dataManager.clearAllData();
+            await this.dataManager.clearAllData();
             this.loadAllData();
             this.renderAllUI();
             this.showNotification('所有数据已清除，已恢复默认设置');
